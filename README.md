@@ -162,7 +162,8 @@ Without these tools, Handy falls back to enigo which may have limited compatibil
 - The recording overlay is disabled by default on Linux (`Overlay Position: None`) because certain compositors treat it as the active window. When the overlay is visible it can steal focus, which prevents Handy from pasting back into the application that triggered transcription. If you enable the overlay anyway, be aware that clipboard-based pasting might fail or end up in the wrong window.
 - If you are having trouble with the app, running with the environment variable `WEBKIT_DISABLE_DMABUF_RENDERER=1` may help
 - If Handy fails to start reliably on Linux, see [Troubleshooting → Linux Startup Crashes or Instability](#linux-startup-crashes-or-instability).
-- **Global keyboard shortcuts (Wayland):** On Wayland, system-level shortcuts must be configured through your desktop environment or window manager. Use the [CLI flags](#cli-parameters) as the command for your custom shortcut.
+- **Push-to-talk shortcuts (Wayland):** In debug settings, select `XDG Desktop Portal (Wayland)`. Your desktop environment owns the final shortcut binding and provides the press/release events required for push-to-talk.
+- **Global keyboard shortcuts (Wayland, fallback):** On Wayland, system-level toggle shortcuts can also be configured through your desktop environment or window manager. Use the [CLI flags](#cli-parameters) as the command for your custom shortcut.
 
   **GNOME:**
   1. Open **Settings > Keyboard > Keyboard Shortcuts > Custom Shortcuts**

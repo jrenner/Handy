@@ -5,12 +5,14 @@
 //!
 //! - `tauri`: Uses Tauri's built-in global-shortcut plugin
 //! - `handy_keys`: Uses the handy-keys library for more control
+//! - `portal`: Uses XDG Desktop Portal GlobalShortcuts on Linux Wayland
 //!
 //! The active implementation is determined by the `keyboard_implementation`
 //! setting and can be changed at runtime.
 
 mod handler;
 pub mod handy_keys;
+mod portal_impl;
 mod tauri_impl;
 
 use log::{error, info, warn};
@@ -53,6 +55,21 @@ pub fn init_shortcuts(app: &AppHandle) {
                 tauri_impl::init_shortcuts(app);
             }
         }
+        KeyboardImplementation::Portal => {
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = portal_impl::init_shortcuts(&app).await {
+                    error!("Failed to initialize XDG Desktop Portal shortcuts: {}", e);
+                    warn!("Falling back to Tauri global shortcut implementation and saving fallback to settings");
+
+                    let mut settings = settings::get_settings(&app);
+                    settings.keyboard_implementation = KeyboardImplementation::Tauri;
+                    settings::write_settings(&app, settings);
+
+                    tauri_impl::init_shortcuts(&app);
+                }
+            });
+        }
     }
 }
 
@@ -62,6 +79,7 @@ pub fn register_cancel_shortcut(app: &AppHandle) {
     match settings.keyboard_implementation {
         KeyboardImplementation::Tauri => tauri_impl::register_cancel_shortcut(app),
         KeyboardImplementation::HandyKeys => handy_keys::register_cancel_shortcut(app),
+        KeyboardImplementation::Portal => portal_impl::register_cancel_shortcut(app),
     }
 }
 
@@ -71,6 +89,7 @@ pub fn unregister_cancel_shortcut(app: &AppHandle) {
     match settings.keyboard_implementation {
         KeyboardImplementation::Tauri => tauri_impl::unregister_cancel_shortcut(app),
         KeyboardImplementation::HandyKeys => handy_keys::unregister_cancel_shortcut(app),
+        KeyboardImplementation::Portal => portal_impl::unregister_cancel_shortcut(app),
     }
 }
 
@@ -80,6 +99,7 @@ pub fn register_shortcut(app: &AppHandle, binding: ShortcutBinding) -> Result<()
     match settings.keyboard_implementation {
         KeyboardImplementation::Tauri => tauri_impl::register_shortcut(app, binding),
         KeyboardImplementation::HandyKeys => handy_keys::register_shortcut(app, binding),
+        KeyboardImplementation::Portal => portal_impl::register_shortcut(app, binding),
     }
 }
 
@@ -89,6 +109,7 @@ pub fn unregister_shortcut(app: &AppHandle, binding: ShortcutBinding) -> Result<
     match settings.keyboard_implementation {
         KeyboardImplementation::Tauri => tauri_impl::unregister_shortcut(app, binding),
         KeyboardImplementation::HandyKeys => handy_keys::unregister_shortcut(app, binding),
+        KeyboardImplementation::Portal => portal_impl::unregister_shortcut(app, binding),
     }
 }
 
@@ -157,6 +178,29 @@ pub fn change_binding(
                 error: None,
             });
         }
+    }
+
+    // Portal shortcuts are configured by the desktop portal, not by Handy's
+    // shortcut parser. Keep the stored value for settings/UI consistency without
+    // rebinding the active portal session.
+    if settings.keyboard_implementation == KeyboardImplementation::Portal {
+        if let Err(e) =
+            validate_shortcut_for_implementation(&binding, settings.keyboard_implementation)
+        {
+            warn!("change_binding validation error: {}", e);
+            return Err(e);
+        }
+
+        let mut updated_binding = binding_to_modify;
+        updated_binding.current_binding = binding;
+        settings.bindings.insert(id, updated_binding.clone());
+        settings::write_settings(&app, settings);
+
+        return Ok(BindingResponse {
+            success: true,
+            binding: Some(updated_binding),
+            error: None,
+        });
     }
 
     // Unregister the existing binding
@@ -253,7 +297,7 @@ pub struct ImplementationChangeResult {
 /// and register them with the new implementation.
 #[tauri::command]
 #[specta::specta]
-pub fn change_keyboard_implementation_setting(
+pub async fn change_keyboard_implementation_setting(
     app: AppHandle,
     implementation: String,
 ) -> Result<ImplementationChangeResult, String> {
@@ -282,7 +326,7 @@ pub fn change_keyboard_implementation_setting(
     settings.keyboard_implementation = new_impl;
     settings::write_settings(&app, settings);
 
-    // Initialize new implementation if needed (HandyKeys needs state)
+    // Initialize implementations with backend-owned state.
     if new_impl == KeyboardImplementation::HandyKeys {
         if initialize_handy_keys_with_rollback(&app)? {
             // Shortcuts already registered during init
@@ -293,9 +337,29 @@ pub fn change_keyboard_implementation_setting(
         }
     }
 
-    // Register all shortcuts with new implementation, resetting invalid ones
-    let reset_bindings = register_all_shortcuts_for_implementation(&app, new_impl);
+    if new_impl == KeyboardImplementation::Portal {
+        if let Err(e) = portal_impl::init_shortcuts(&app).await {
+            error!("Failed to initialize XDG Desktop Portal shortcuts: {}", e);
 
+            let mut settings = settings::get_settings(&app);
+            settings.keyboard_implementation = current_impl;
+            settings::write_settings(&app, settings);
+            register_all_shortcuts_for_implementation(&app, current_impl);
+
+            return Err(format!(
+                "Failed to initialize XDG Desktop Portal shortcuts: {}",
+                e
+            ));
+        }
+    }
+
+    // Register all shortcuts with new implementation, resetting invalid ones.
+    // Portal shortcuts are registered as a session above.
+    let reset_bindings = if new_impl == KeyboardImplementation::Portal {
+        vec![]
+    } else {
+        register_all_shortcuts_for_implementation(&app, new_impl)
+    };
     // Emit event to notify frontend of the change
     let _ = app.emit(
         "settings-changed",
@@ -322,6 +386,7 @@ pub fn get_keyboard_implementation(app: AppHandle) -> String {
     match settings.keyboard_implementation {
         KeyboardImplementation::Tauri => "tauri".to_string(),
         KeyboardImplementation::HandyKeys => "handy_keys".to_string(),
+        KeyboardImplementation::Portal => "portal".to_string(),
     }
 }
 
@@ -337,6 +402,7 @@ fn validate_shortcut_for_implementation(
     match implementation {
         KeyboardImplementation::Tauri => tauri_impl::validate_shortcut(raw),
         KeyboardImplementation::HandyKeys => handy_keys::validate_shortcut(raw),
+        KeyboardImplementation::Portal => portal_impl::validate_shortcut(raw),
     }
 }
 
@@ -345,6 +411,7 @@ fn parse_keyboard_implementation(s: &str) -> KeyboardImplementation {
     match s {
         "tauri" => KeyboardImplementation::Tauri,
         "handy_keys" => KeyboardImplementation::HandyKeys,
+        "portal" => KeyboardImplementation::Portal,
         other => {
             warn!(
                 "Invalid keyboard implementation '{}', defaulting to tauri",
@@ -357,6 +424,10 @@ fn parse_keyboard_implementation(s: &str) -> KeyboardImplementation {
 
 /// Unregister all shortcuts for the current implementation
 fn unregister_all_shortcuts(app: &AppHandle, implementation: KeyboardImplementation) {
+    if implementation == KeyboardImplementation::Portal {
+        portal_impl::stop_shortcuts(app);
+        return;
+    }
     let bindings = settings::get_bindings(app);
 
     for (id, binding) in bindings {
@@ -368,6 +439,7 @@ fn unregister_all_shortcuts(app: &AppHandle, implementation: KeyboardImplementat
         let result = match implementation {
             KeyboardImplementation::Tauri => tauri_impl::unregister_shortcut(app, binding),
             KeyboardImplementation::HandyKeys => handy_keys::unregister_shortcut(app, binding),
+            KeyboardImplementation::Portal => portal_impl::unregister_shortcut(app, binding),
         };
 
         if let Err(e) = result {
@@ -426,6 +498,7 @@ fn register_all_shortcuts_for_implementation(
         let result = match implementation {
             KeyboardImplementation::Tauri => tauri_impl::register_shortcut(app, binding),
             KeyboardImplementation::HandyKeys => handy_keys::register_shortcut(app, binding),
+            KeyboardImplementation::Portal => portal_impl::register_shortcut(app, binding),
         };
 
         if let Err(e) = result {

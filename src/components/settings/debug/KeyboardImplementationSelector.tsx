@@ -5,10 +5,14 @@ import { Dropdown, type DropdownOption } from "../../ui/Dropdown";
 import { useSettings } from "../../../hooks/useSettings";
 import { commands } from "@/bindings";
 import { toast } from "sonner";
+import { platform } from "@tauri-apps/plugin-os";
 
 const KEYBOARD_IMPLEMENTATION_OPTIONS: DropdownOption[] = [
   { value: "tauri", label: "Tauri Global Shortcut" },
   { value: "handy_keys", label: "Handy Keys" },
+  ...(platform() === "linux"
+    ? [{ value: "portal", label: "XDG Desktop Portal (Wayland)" }]
+    : []),
 ];
 
 interface KeyboardImplementationSelectorProps {
