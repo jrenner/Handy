@@ -80,7 +80,7 @@ mod linux {
             .await
             .map_err(|e| format!("Failed to create XDG GlobalShortcuts session: {e}"))?;
 
-        let shortcuts = portal_shortcuts(app);
+        let shortcuts = portal_shortcuts(app)?;
         if shortcuts.is_empty() {
             return Ok(());
         }
@@ -89,9 +89,16 @@ mod linux {
             .bind_shortcuts(&session, &shortcuts, None, BindShortcutsOptions::default())
             .await
             .map_err(|e| format!("Failed to bind XDG GlobalShortcuts: {e}"))?;
-        request
+        let response = request
             .response()
             .map_err(|e| format!("XDG GlobalShortcuts binding was not accepted: {e}"))?;
+        for shortcut in response.shortcuts() {
+            info!(
+                "XDG GlobalShortcuts bound '{}' as '{}'",
+                shortcut.id(),
+                shortcut.trigger_description()
+            );
+        }
 
         let (shutdown_sender, mut shutdown_receiver) = oneshot::channel();
         let state = portal_state(app);
@@ -144,11 +151,7 @@ mod linux {
     }
 
     pub(crate) fn validate_shortcut(raw: &str) -> Result<(), String> {
-        if raw.trim().is_empty() {
-            Err("Shortcut cannot be empty".into())
-        } else {
-            Ok(())
-        }
+        shortcut_to_xdg_trigger(raw).map(|_| ())
     }
 
     pub(crate) fn register_cancel_shortcut(_app: &AppHandle) {}
@@ -177,7 +180,7 @@ mod linux {
         app.state::<PortalShortcutState>()
     }
 
-    fn portal_shortcuts(app: &AppHandle) -> Vec<NewShortcut> {
+    fn portal_shortcuts(app: &AppHandle) -> Result<Vec<NewShortcut>, String> {
         let settings = settings::get_settings(app);
         let defaults = settings::get_default_settings().bindings;
 
@@ -188,10 +191,96 @@ mod linux {
                     return None;
                 }
 
-                let binding = settings.bindings.get(*id).or_else(|| defaults.get(*id))?;
-                Some(NewShortcut::new(binding.id.clone(), binding.name.clone()))
+                settings.bindings.get(*id).or_else(|| defaults.get(*id))
+            })
+            .map(|binding| {
+                let trigger = shortcut_to_xdg_trigger(&binding.current_binding)?;
+                Ok(NewShortcut::new(binding.id.clone(), binding.name.clone())
+                    .preferred_trigger(Some(trigger.as_str())))
             })
             .collect()
+    }
+
+    fn shortcut_to_xdg_trigger(raw: &str) -> Result<String, String> {
+        let parts: Vec<&str> = raw
+            .split('+')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .collect();
+
+        if parts.is_empty() {
+            return Err("Shortcut cannot be empty".into());
+        }
+
+        let mut modifiers = Vec::new();
+        let mut key = None;
+
+        for part in parts {
+            match part.to_ascii_lowercase().as_str() {
+                "ctrl" | "control" => modifiers.push("CTRL"),
+                "alt" | "option" => modifiers.push("ALT"),
+                "shift" => modifiers.push("SHIFT"),
+                "super" | "meta" | "cmd" | "command" | "win" | "windows" => modifiers.push("LOGO"),
+                "num" => modifiers.push("NUM"),
+                "fn" | "function" => {
+                    return Err(
+                        "The 'fn' key is not supported by XDG Desktop Portal shortcuts".into(),
+                    )
+                }
+                other => {
+                    if key.is_some() {
+                        return Err(format!(
+                            "Portal shortcuts must contain exactly one main key: '{raw}'"
+                        ));
+                    }
+                    key = Some(xdg_key_name(other)?);
+                }
+            }
+        }
+
+        let key = key.ok_or_else(|| {
+            "Portal shortcuts must include a main key (letter, number, F-key, etc.) in addition to modifiers".to_string()
+        })?;
+
+        modifiers.dedup();
+        modifiers.push(key.as_str());
+        Ok(modifiers.join("+"))
+    }
+
+    fn xdg_key_name(key: &str) -> Result<String, String> {
+        let mapped = match key {
+            "space" => "space",
+            "enter" | "return" => "Return",
+            "esc" | "escape" => "Escape",
+            "backspace" => "BackSpace",
+            "tab" => "Tab",
+            "delete" | "del" => "Delete",
+            "insert" | "ins" => "Insert",
+            "home" => "Home",
+            "end" => "End",
+            "pageup" | "page_up" => "Page_Up",
+            "pagedown" | "page_down" => "Page_Down",
+            "up" | "arrowup" => "Up",
+            "down" | "arrowdown" => "Down",
+            "left" | "arrowleft" => "Left",
+            "right" | "arrowright" => "Right",
+            key if key.len() == 1 && key.chars().all(|c| c.is_ascii_alphanumeric()) => key,
+            key if is_function_key(key) => return Ok(key.to_ascii_uppercase()),
+            key if key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => key,
+            _ => return Err(format!("Unsupported portal shortcut key '{key}'")),
+        };
+
+        Ok(mapped.to_string())
+    }
+
+    fn is_function_key(key: &str) -> bool {
+        let Some(number) = key.strip_prefix('f') else {
+            return false;
+        };
+        number
+            .parse::<u8>()
+            .map(|n| (1..=35).contains(&n))
+            .unwrap_or(false)
     }
 
     fn handle_portal_event(app: &AppHandle, shortcut_id: &str, is_pressed: bool) {
