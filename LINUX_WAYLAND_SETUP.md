@@ -247,11 +247,59 @@ ydotool type stderr: ydotool: notice: Using ydotoold backend
 
 ## Troubleshooting
 
+### Fixing the settings file
+
+Settings live in `~/.local/share/com.pais.handy/settings_store.json` (keys are
+nested under a top-level `"settings"` object). The three that matter on
+GNOME/Wayland and their required values:
+
+| Key                       | Must be  |
+| ------------------------- | -------- |
+| `keyboard_implementation` | `portal` |
+| `overlay_position`        | `none`   |
+| `push_to_talk`            | `true`   |
+
+To reset them safely, **quit Handy first** (the app overwrites the file on
+exit, so edits made while it's running are lost), then:
+
+```bash
+pkill -x handy
+python3 - <<'PY'
+import json
+p = __import__("os").path.expanduser("~/.local/share/com.pais.handy/settings_store.json")
+d = json.load(open(p))
+d["settings"]["keyboard_implementation"] = "portal"
+d["settings"]["overlay_position"] = "none"
+d["settings"]["push_to_talk"] = True
+json.dump(d, open(p, "w"), indent=1)
+print("fixed:", {k: d["settings"][k] for k in
+      ("keyboard_implementation", "overlay_position", "push_to_talk")})
+PY
+```
+
+Then start Handy again. You can also change `keyboard_implementation` from the
+app: enable debug mode (`Ctrl+Shift+D`) and pick **XDG Desktop Portal (Wayland)**
+in the Keyboard Implementation selector.
+
+> **Why `keyboard_implementation` reverts to `tauri`:** if the portal shortcut
+> fails to initialize, Handy falls back to the (Wayland-incapable) `tauri`
+> backend **and persists that choice** to settings — so it stays broken on the
+> next launch until you set it back to `portal`. The most common trigger is
+> **two instances running at once** (e.g. launching a second copy while one is
+> already up) contending for the portal session. Run a single instance; the
+> single-instance guard normally routes a second launch to the running one.
+
+### Other issues
+
 - **Hotkey does nothing / log says "Falling back to Tauri ... implementation"**
-  The portal bind was rejected. Ensure `com.pais.handy.desktop` exists in
-  `~/.local/share/applications/` (so GNOME can identify the app), then restart
+  The portal bind was rejected. First check `keyboard_implementation` is
+  `portal` (see above). Then ensure `com.pais.handy.desktop` exists in
+  `~/.local/share/applications/` (so GNOME can identify the app), and restart
   Handy. Check `journalctl --user -b | grep -i shortcut` for
-  `invalid app_id` messages.
+  `invalid app_id` messages. A healthy startup logs (look in the journal for a
+  GNOME-launched app, or run from a terminal with `RUST_LOG=info`):
+  `Registered app id 'com.pais.handy' …` → `XDG GlobalShortcuts bound …` →
+  `XDG GlobalShortcuts portal initialized`.
 
 - **Words transcribe but no text appears**
   Text injection isn't reaching the focused window:
