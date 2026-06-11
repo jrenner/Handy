@@ -174,10 +174,29 @@ pub enum KeyboardImplementation {
 impl Default for KeyboardImplementation {
     fn default() -> Self {
         #[cfg(target_os = "linux")]
-        return KeyboardImplementation::Tauri;
+        {
+            // On Wayland, neither the Tauri global-shortcut plugin nor handy-keys
+            // can grab global hotkeys, so default to the XDG Desktop Portal which
+            // is the supported path there. Fall back to Tauri on X11.
+            if is_wayland_session() {
+                return KeyboardImplementation::Portal;
+            }
+            return KeyboardImplementation::Tauri;
+        }
         #[cfg(not(target_os = "linux"))]
         return KeyboardImplementation::HandyKeys;
     }
+}
+
+/// Detect whether we are running under a Wayland session.
+#[cfg(target_os = "linux")]
+fn is_wayland_session() -> bool {
+    std::env::var("WAYLAND_DISPLAY")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+        || std::env::var("XDG_SESSION_TYPE")
+            .map(|v| v.eq_ignore_ascii_case("wayland"))
+            .unwrap_or(false)
 }
 
 impl Default for ModelUnloadTimeout {

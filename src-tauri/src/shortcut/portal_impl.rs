@@ -24,6 +24,10 @@ mod linux {
     const PORTAL_HOTKEY_LABEL: &str = "xdg-desktop-portal";
     const PORTAL_SHORTCUT_IDS: [&str; 2] = ["transcribe", "transcribe_with_post_process"];
 
+    /// App id used to identify Handy to the desktop portal. Must match an
+    /// installed `<app_id>.desktop` file (see `ensure_desktop_entry`).
+    const PORTAL_APP_ID: &str = "com.pais.handy";
+
     struct PortalShortcutState {
         shutdown: Mutex<Option<oneshot::Sender<()>>>,
     }
@@ -58,13 +62,28 @@ mod linux {
     pub(crate) async fn init_shortcuts(app: &AppHandle) -> Result<(), String> {
         stop_shortcuts(app);
 
+        // GNOME's GlobalShortcuts backend rejects bind requests from
+        // applications it cannot identify (logging "invalid app_id"). A
+        // non-sandboxed app must announce its app id — matching an installed
+        // `.desktop` file — to the portal over the same D-Bus connection that
+        // ashpd uses for its portal calls. ashpd shares a single process-wide
+        // session connection, so registering here applies to bind_shortcuts
+        // below. Best-effort: portals that don't need it simply ignore it.
+        ensure_desktop_entry();
+        register_host_app_id().await;
+
         let portal = GlobalShortcuts::new()
             .await
             .map_err(|e| format!("XDG GlobalShortcuts portal is unavailable: {e}"))?;
-        if portal.version() < 2 {
+        // Version 1 of the GlobalShortcuts interface already emits the
+        // `Activated`/`Deactivated` signals we rely on for push-to-talk
+        // (press → Activated, release → Deactivated). GNOME ships version 1,
+        // so only reject a hypothetical version 0.
+        let version = portal.version();
+        info!("XDG GlobalShortcuts portal version {version}");
+        if version < 1 {
             return Err(format!(
-                "XDG GlobalShortcuts portal version {} does not support release events",
-                portal.version()
+                "XDG GlobalShortcuts portal version {version} is too old (need >= 1)"
             ));
         }
 
@@ -173,6 +192,74 @@ mod linux {
         }
     }
 
+    /// Announce our app id to the desktop portal so backends (notably GNOME)
+    /// can identify Handy and accept global-shortcut binds.
+    async fn register_host_app_id() {
+        match ashpd::AppID::try_from(PORTAL_APP_ID) {
+            Ok(app_id) => match ashpd::register_host_app(app_id).await {
+                Ok(()) => info!("Registered app id '{PORTAL_APP_ID}' with the desktop portal"),
+                Err(e) => {
+                    warn!("Could not register app id '{PORTAL_APP_ID}' with the portal: {e}")
+                }
+            },
+            Err(e) => warn!("Portal app id '{PORTAL_APP_ID}' is invalid: {e}"),
+        }
+    }
+
+    /// Ensure a `<PORTAL_APP_ID>.desktop` file exists in the user's
+    /// applications directory. The portal looks up app info by this file when an
+    /// app registers; without it GNOME reports "App info not found" and rejects
+    /// the shortcut bind. We only create it when missing and never overwrite a
+    /// file installed by a real package.
+    fn ensure_desktop_entry() {
+        let Some(data_home) = user_data_home() else {
+            warn!("Could not determine data dir for portal desktop entry");
+            return;
+        };
+        let apps_dir = data_home.join("applications");
+        let desktop_path = apps_dir.join(format!("{PORTAL_APP_ID}.desktop"));
+        if desktop_path.exists() {
+            return;
+        }
+
+        let exec = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.to_str().map(str::to_owned))
+            .unwrap_or_else(|| "handy".to_string());
+
+        let contents = format!(
+            "[Desktop Entry]\n\
+             Type=Application\n\
+             Name=Handy\n\
+             Comment=Offline speech-to-text application\n\
+             Exec={exec} %U\n\
+             Terminal=false\n\
+             Categories=Utility;AudioVideo;Audio;\n\
+             StartupWMClass={PORTAL_APP_ID}\n\
+             NoDisplay=true\n"
+        );
+
+        if let Err(e) = std::fs::create_dir_all(&apps_dir) {
+            warn!("Could not create {}: {e}", apps_dir.display());
+            return;
+        }
+        if let Err(e) = std::fs::write(&desktop_path, contents) {
+            warn!("Could not write portal desktop entry {}: {e}", desktop_path.display());
+        } else {
+            info!("Wrote portal desktop entry {}", desktop_path.display());
+        }
+    }
+
+    /// `$XDG_DATA_HOME`, falling back to `$HOME/.local/share`.
+    fn user_data_home() -> Option<std::path::PathBuf> {
+        if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
+            if !dir.is_empty() {
+                return Some(std::path::PathBuf::from(dir));
+            }
+        }
+        std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".local/share"))
+    }
+
     fn portal_state(app: &AppHandle) -> tauri::State<'_, PortalShortcutState> {
         if app.try_state::<PortalShortcutState>().is_none() {
             app.manage(PortalShortcutState::default());
@@ -184,7 +271,11 @@ mod linux {
         let settings = settings::get_settings(app);
         let defaults = settings::get_default_settings().bindings;
 
-        PORTAL_SHORTCUT_IDS
+        // Build the list of shortcuts to bind. A single binding that cannot be
+        // expressed as an XDG trigger (e.g. a key the portal does not support)
+        // must not abort binding of the remaining shortcuts, so skip it with a
+        // warning instead of failing the whole portal session.
+        let shortcuts = PORTAL_SHORTCUT_IDS
             .iter()
             .filter_map(|id| {
                 if *id == "transcribe_with_post_process" && !settings.post_process_enabled {
@@ -193,12 +284,22 @@ mod linux {
 
                 settings.bindings.get(*id).or_else(|| defaults.get(*id))
             })
-            .map(|binding| {
-                let trigger = shortcut_to_xdg_trigger(&binding.current_binding)?;
-                Ok(NewShortcut::new(binding.id.clone(), binding.name.clone())
-                    .preferred_trigger(Some(trigger.as_str())))
+            .filter_map(|binding| match shortcut_to_xdg_trigger(&binding.current_binding) {
+                Ok(trigger) => Some(
+                    NewShortcut::new(binding.id.clone(), binding.name.clone())
+                        .preferred_trigger(Some(trigger.as_str())),
+                ),
+                Err(e) => {
+                    warn!(
+                        "Skipping portal shortcut '{}' ({}): {e}",
+                        binding.id, binding.current_binding
+                    );
+                    None
+                }
             })
-            .collect()
+            .collect();
+
+        Ok(shortcuts)
     }
 
     fn shortcut_to_xdg_trigger(raw: &str) -> Result<String, String> {
@@ -264,6 +365,18 @@ mod linux {
             "down" | "arrowdown" => "Down",
             "left" | "arrowleft" => "Left",
             "right" | "arrowright" => "Right",
+            // Punctuation keys, mapped to their xkb keysym names.
+            "[" => "bracketleft",
+            "]" => "bracketright",
+            ";" => "semicolon",
+            "'" => "apostrophe",
+            "," => "comma",
+            "." => "period",
+            "/" => "slash",
+            "\\" => "backslash",
+            "-" => "minus",
+            "=" => "equal",
+            "`" => "grave",
             key if key.len() == 1 && key.chars().all(|c| c.is_ascii_alphanumeric()) => key,
             key if is_function_key(key) => return Ok(key.to_ascii_uppercase()),
             key if key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => key,

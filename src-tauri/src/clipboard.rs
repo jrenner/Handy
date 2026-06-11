@@ -10,7 +10,17 @@ use tauri::{AppHandle, Manager};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 
 #[cfg(target_os = "linux")]
-use crate::utils::{is_kde_wayland, is_wayland};
+use crate::utils::{is_gnome_wayland, is_kde_wayland, is_wayland};
+
+/// Whether `wtype` can synthesize input on the current compositor.
+///
+/// `wtype` needs `zwp_virtual_keyboard_manager_v1`, which neither KWin (KDE)
+/// nor Mutter (GNOME) implement. On those compositors we must fall through to a
+/// uinput-based tool (dotool/ydotool) instead.
+#[cfg(target_os = "linux")]
+fn is_wtype_usable() -> bool {
+    !is_kde_wayland() && !is_gnome_wayland() && is_wtype_available()
+}
 
 /// Pastes text using the clipboard: saves current content, writes text, sends paste keystroke, restores clipboard.
 fn paste_via_clipboard(
@@ -83,9 +93,10 @@ fn paste_via_clipboard(
 #[cfg(target_os = "linux")]
 fn try_send_key_combo_linux(paste_method: &PasteMethod) -> Result<bool, String> {
     if is_wayland() {
-        // Wayland: prefer wtype (but not on KDE), then dotool, then ydotool
-        // Note: wtype doesn't work on KDE (no zwp_virtual_keyboard_manager_v1 support)
-        if !is_kde_wayland() && is_wtype_available() {
+        // Wayland: prefer wtype (where the virtual-keyboard protocol exists),
+        // then dotool, then ydotool. wtype works on wlroots compositors but not
+        // on KDE/KWin or GNOME/Mutter.
+        if is_wtype_usable() {
             info!("Using wtype for key combo");
             send_key_combo_via_wtype(paste_method)?;
             return Ok(true);
@@ -164,9 +175,10 @@ fn try_direct_typing_linux(text: &str, preferred_tool: TypingTool) -> Result<boo
             type_text_via_kwtype(text)?;
             return Ok(true);
         }
-        // Wayland: prefer wtype, then dotool, then ydotool
-        // Note: wtype doesn't work on KDE (no zwp_virtual_keyboard_manager_v1 support)
-        if !is_kde_wayland() && is_wtype_available() {
+        // Wayland: prefer wtype (where the virtual-keyboard protocol exists),
+        // then dotool, then ydotool. wtype works on wlroots compositors but not
+        // on KDE/KWin or GNOME/Mutter.
+        if is_wtype_usable() {
             info!("Using wtype for direct text input");
             type_text_via_wtype(text)?;
             return Ok(true);
@@ -355,8 +367,15 @@ fn type_text_via_ydotool(text: &str) -> Result<(), String> {
         .output()
         .map_err(|e| format!("Failed to execute ydotool: {}", e))?;
 
+    // ydotool reports its backend ("Using ydotoold backend" vs
+    // "backend unavailable") and any errors on stderr, even on success. Log it
+    // so daemonless/misconfigured setups are diagnosable.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.trim().is_empty() {
+        info!("ydotool type stderr: {}", stderr.trim());
+    }
+
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("ydotool failed: {}", stderr));
     }
 

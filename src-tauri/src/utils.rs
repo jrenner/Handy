@@ -64,3 +64,21 @@ pub fn is_kde_plasma() -> bool {
 pub fn is_kde_wayland() -> bool {
     is_wayland() && is_kde_plasma()
 }
+
+/// Check if running on the GNOME desktop environment
+#[cfg(target_os = "linux")]
+pub fn is_gnome() -> bool {
+    std::env::var("XDG_CURRENT_DESKTOP")
+        .map(|v| v.to_uppercase().contains("GNOME"))
+        .unwrap_or(false)
+}
+
+/// Check if running on GNOME with Wayland.
+///
+/// Like KWin, GNOME's Mutter does not implement the
+/// `zwp_virtual_keyboard_manager_v1` protocol, so `wtype` cannot synthesize
+/// input there and a uinput-based tool (dotool/ydotool) must be used instead.
+#[cfg(target_os = "linux")]
+pub fn is_gnome_wayland() -> bool {
+    is_wayland() && is_gnome()
+}
