@@ -286,8 +286,15 @@ in the Keyboard Implementation selector.
 > backend **and persists that choice** to settings — so it stays broken on the
 > next launch until you set it back to `portal`. The most common trigger is
 > **two instances running at once** (e.g. launching a second copy while one is
-> already up) contending for the portal session. Run a single instance; the
-> single-instance guard normally routes a second launch to the running one.
+> already up) contending for the portal session.
+
+> **Tip — avoid the revert:** launch Handy **only one way**. Let autostart (or
+> the Super → "Handy" launcher) run a single instance, and don't start a second
+> copy from a terminal while one is already running. The single-instance guard
+> normally routes a second launch to the running instance, but starting several
+> at once (as can happen during development/testing) can race the portal session
+> and trip the fallback. If the hotkey suddenly stops working, suspect this
+> first and re-check `keyboard_implementation` (above).
 
 ### Other issues
 
