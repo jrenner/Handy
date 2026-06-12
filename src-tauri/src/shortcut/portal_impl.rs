@@ -244,7 +244,10 @@ mod linux {
             return;
         }
         if let Err(e) = std::fs::write(&desktop_path, contents) {
-            warn!("Could not write portal desktop entry {}: {e}", desktop_path.display());
+            warn!(
+                "Could not write portal desktop entry {}: {e}",
+                desktop_path.display()
+            );
         } else {
             info!("Wrote portal desktop entry {}", desktop_path.display());
         }
@@ -284,22 +287,88 @@ mod linux {
 
                 settings.bindings.get(*id).or_else(|| defaults.get(*id))
             })
-            .filter_map(|binding| match shortcut_to_xdg_trigger(&binding.current_binding) {
-                Ok(trigger) => Some(
-                    NewShortcut::new(binding.id.clone(), binding.name.clone())
-                        .preferred_trigger(Some(trigger.as_str())),
-                ),
-                Err(e) => {
-                    warn!(
-                        "Skipping portal shortcut '{}' ({}): {e}",
-                        binding.id, binding.current_binding
-                    );
-                    None
-                }
-            })
+            .filter_map(
+                |binding| match shortcut_to_xdg_trigger(&binding.current_binding) {
+                    Ok(trigger) => {
+                        let shortcut_id = portal_shortcut_id(&binding.id, &trigger);
+                        Some(
+                            NewShortcut::new(shortcut_id, binding.name.clone())
+                                .preferred_trigger(Some(trigger.as_str())),
+                        )
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Skipping portal shortcut '{}' ({}): {e}",
+                            binding.id, binding.current_binding
+                        );
+                        None
+                    }
+                },
+            )
             .collect();
 
         Ok(shortcuts)
+    }
+
+    /// Build the portal action id for a shortcut. The XDG portal persists user
+    /// bindings by app id + shortcut id, and may prefer that persisted value
+    /// over a later `preferred_trigger`. Include a stable fingerprint of Handy's
+    /// current preferred trigger so changing the hotkey in Handy creates a fresh
+    /// portal action instead of reusing a stale compositor-owned binding.
+    fn portal_shortcut_id(binding_id: &str, trigger: &str) -> String {
+        format!("{}-{:016x}", binding_id, stable_hash(trigger))
+    }
+
+    fn base_portal_shortcut_id(shortcut_id: &str) -> Option<&'static str> {
+        for base_id in PORTAL_SHORTCUT_IDS {
+            if shortcut_id == base_id {
+                return Some(base_id);
+            }
+
+            if let Some(suffix) = shortcut_id.strip_prefix(base_id) {
+                if suffix.starts_with('-') {
+                    return Some(base_id);
+                }
+            }
+        }
+
+        None
+    }
+
+    fn stable_hash(value: &str) -> u64 {
+        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+        const FNV_PRIME: u64 = 0x100000001b3;
+
+        value.bytes().fold(FNV_OFFSET, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn portal_shortcut_ids_round_trip_to_base_ids() {
+            let transcribe_id = portal_shortcut_id("transcribe", "CTRL+ALT+bracketright");
+
+            assert_ne!(transcribe_id, "transcribe");
+            assert_eq!(base_portal_shortcut_id(&transcribe_id), Some("transcribe"));
+            assert_eq!(base_portal_shortcut_id("transcribe"), Some("transcribe"));
+            assert_eq!(
+                base_portal_shortcut_id("transcribe_with_post_process-deadbeef"),
+                Some("transcribe_with_post_process")
+            );
+            assert_eq!(base_portal_shortcut_id("transcribe_unknown"), None);
+        }
+
+        #[test]
+        fn portal_shortcut_ids_change_with_preferred_trigger() {
+            assert_ne!(
+                portal_shortcut_id("transcribe", "CTRL+ALT+bracketright"),
+                portal_shortcut_id("transcribe", "CTRL+ALT+space")
+            );
+        }
     }
 
     fn shortcut_to_xdg_trigger(raw: &str) -> Result<String, String> {
@@ -402,11 +471,16 @@ mod linux {
             return;
         }
 
-        handle_shortcut_event(app, shortcut_id, PORTAL_HOTKEY_LABEL, is_pressed);
+        let Some(binding_id) = base_portal_shortcut_id(shortcut_id) else {
+            warn!("Ignoring unknown portal shortcut event for '{shortcut_id}'");
+            return;
+        };
+
+        handle_shortcut_event(app, binding_id, PORTAL_HOTKEY_LABEL, is_pressed);
     }
 
     fn is_portal_shortcut(id: &str) -> bool {
-        PORTAL_SHORTCUT_IDS.contains(&id)
+        base_portal_shortcut_id(id).is_some()
     }
 }
 

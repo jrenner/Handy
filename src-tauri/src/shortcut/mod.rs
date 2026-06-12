@@ -180,21 +180,35 @@ pub fn change_binding(
         }
     }
 
-    // Portal shortcuts are configured by the desktop portal, not by Handy's
-    // shortcut parser. Keep the stored value for settings/UI consistency without
-    // rebinding the active portal session.
-    if settings.keyboard_implementation == KeyboardImplementation::Portal {
-        if let Err(e) =
-            validate_shortcut_for_implementation(&binding, settings.keyboard_implementation)
-        {
-            warn!("change_binding validation error: {}", e);
-            return Err(e);
-        }
+    // Validate the new shortcut for the current keyboard implementation before
+    // touching the active registration. This keeps the old shortcut alive when
+    // a user enters a binding the backend cannot parse.
+    if let Err(e) = validate_shortcut_for_implementation(&binding, settings.keyboard_implementation)
+    {
+        warn!("change_binding validation error: {}", e);
+        return Err(e);
+    }
 
+    // Portal shortcuts are session-level and desktop-owned. Save Handy's
+    // preferred trigger, then restart the portal session so the compositor sees
+    // the new preferred trigger. The desktop portal may still choose an existing
+    // user binding; portal_impl uses binding-derived action IDs to avoid stale
+    // bindings when Handy's preferred trigger changes.
+    if settings.keyboard_implementation == KeyboardImplementation::Portal {
         let mut updated_binding = binding_to_modify;
         updated_binding.current_binding = binding;
         settings.bindings.insert(id, updated_binding.clone());
         settings::write_settings(&app, settings);
+
+        if let Err(e) = register_shortcut(&app, updated_binding.clone()) {
+            let error_msg = format!("Failed to refresh portal shortcut: {}", e);
+            error!("change_binding error: {}", error_msg);
+            return Ok(BindingResponse {
+                success: false,
+                binding: None,
+                error: Some(error_msg),
+            });
+        }
 
         return Ok(BindingResponse {
             success: true,
@@ -209,21 +223,22 @@ pub fn change_binding(
         error!("change_binding error: {}", error_msg);
     }
 
-    // Validate the new shortcut for the current keyboard implementation
-    if let Err(e) = validate_shortcut_for_implementation(&binding, settings.keyboard_implementation)
-    {
-        warn!("change_binding validation error: {}", e);
-        return Err(e);
-    }
-
     // Create an updated binding
-    let mut updated_binding = binding_to_modify;
+    let mut updated_binding = binding_to_modify.clone();
     updated_binding.current_binding = binding;
 
     // Register the new binding
     if let Err(e) = register_shortcut(&app, updated_binding.clone()) {
         let error_msg = format!("Failed to register shortcut: {}", e);
         error!("change_binding error: {}", error_msg);
+
+        if let Err(restore_error) = register_shortcut(&app, binding_to_modify) {
+            error!(
+                "Failed to restore previous shortcut after registration failure: {}",
+                restore_error
+            );
+        }
+
         return Ok(BindingResponse {
             success: false,
             binding: None,
@@ -257,7 +272,17 @@ pub fn reset_binding(app: AppHandle, id: String) -> Result<BindingResponse, Stri
 #[tauri::command]
 #[specta::specta]
 pub fn suspend_binding(app: AppHandle, id: String) -> Result<(), String> {
-    if let Some(b) = settings::get_bindings(&app).get(&id).cloned() {
+    let current_settings = settings::get_settings(&app);
+
+    // XDG Desktop Portal shortcuts cannot be suspended per binding. Restarting
+    // the portal session here would immediately re-bind the same shortcut and
+    // can make the settings UI look like it changed an active portal shortcut
+    // when it did not. Portal changes are applied from change_binding instead.
+    if current_settings.keyboard_implementation == KeyboardImplementation::Portal {
+        return Ok(());
+    }
+
+    if let Some(b) = current_settings.bindings.get(&id).cloned() {
         if let Err(e) = unregister_shortcut(&app, b) {
             error!("suspend_binding error for id '{}': {}", id, e);
             return Err(e);
@@ -270,7 +295,13 @@ pub fn suspend_binding(app: AppHandle, id: String) -> Result<(), String> {
 #[tauri::command]
 #[specta::specta]
 pub fn resume_binding(app: AppHandle, id: String) -> Result<(), String> {
-    if let Some(b) = settings::get_bindings(&app).get(&id).cloned() {
+    let current_settings = settings::get_settings(&app);
+
+    if current_settings.keyboard_implementation == KeyboardImplementation::Portal {
+        return Ok(());
+    }
+
+    if let Some(b) = current_settings.bindings.get(&id).cloned() {
         if let Err(e) = register_shortcut(&app, b) {
             error!("resume_binding error for id '{}': {}", id, e);
             return Err(e);
